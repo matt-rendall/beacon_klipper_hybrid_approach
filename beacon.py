@@ -1464,7 +1464,7 @@ class BeaconProbe:
         speed = gcmd.get_float(
             "SPEED", self.autocal_speed, above=0, maxval=self.autocal_max_speed
         )
-        # [CUSTOM] New parameter approach_speed
+        # [CUSTOM] New parameter approach_speed for fast initial proximity approach
         approach_speed = gcmd.get_float(
             "APPROACH_SPEED", self.approach_speed, above=0)
         desired_accel = gcmd.get_float("ACCEL", self.autocal_accel, minval=1)
@@ -1506,15 +1506,17 @@ class BeaconProbe:
         self.mcu_contact_probe.activate_gcode.run_gcode_from_command()
         try:
             self.compat_toolhead_set_position_homing_z(self.toolhead, force_pos)
+            # [CUSTOM] Track if this is the initial approach for hybrid probing
             initial_approach = True
             retries = 0
             while len(stop_samples) < sample_count:
-                # [CUSTOM] Logic for fast initial approach using proximity sensor
+                # [CUSTOM] On first iteration, use fast proximity approach to get close
                 if initial_approach:
-                    gcmd.respond_info("Initial approach")
+                    gcmd.respond_info("Initial proximity approach")
                     self.toolhead.wait_moves()
                     set_max_accel(desired_accel)
                     try:
+                        # Use proximity sensor for fast approach with minimal samples
                         self._probe(approach_speed, num_samples=2)
                     except self.printer.command_error:
                         if self.printer.is_shutdown():
@@ -1529,6 +1531,8 @@ class BeaconProbe:
                         "Collecting sample %d/%d"
                         % (len(stop_samples) + 1, sample_count)
                     )
+
+                # Now do accurate contact probe
                 self.toolhead.wait_moves()
                 set_max_accel(desired_accel)
                 try:
@@ -1552,6 +1556,7 @@ class BeaconProbe:
                 self.toolhead.move(retract_pos, retract_speed)
                 self.toolhead.dwell(1.0)
 
+                # [CUSTOM] Only collect samples after initial approach
                 if not initial_approach:
                     stop_samples.append(epos[2])
                     mean = np.mean(stop_samples)
@@ -1568,8 +1573,10 @@ class BeaconProbe:
                         )
                         retries += 1
                         stop_samples = []
+                        # [CUSTOM] Reset to initial approach on retry
                         initial_approach = True
                 else:
+                    # [CUSTOM] After first successful proximity+contact, switch to contact-only
                     initial_approach = False
 
             gcmd.respond_info(
@@ -1655,6 +1662,19 @@ class BeaconProbe:
             "delta": delta,
         }
 
+def prb_proberesult(beacon, test_pos):
+    (x, y, z) = beacon.get_offsets()
+    return manual_probe.ProbeResult(
+        test_pos[0] + x,
+        test_pos[1] + y,
+        test_pos[2] - z,
+        test_pos[0],
+        test_pos[1],
+        test_pos[2],
+    )
+
+def prb_identity(beacon, test_pos):
+    return test_pos
 
 class BeaconModel:
     @classmethod
@@ -1680,7 +1700,7 @@ class BeaconModel:
         configfile = beacon.printer.lookup_object("configfile")
         sensor_name = "" if beacon.id.is_unnamed() else "sensor %s " % (beacon.id.name)
         section = "beacon " + sensor_name + "model " + self.name
-        configfile.set(section, "model_coef", ",\n ".join(map(str, self.poly.coef)))
+        configfile.set(section, "model_coef", ",\n  ".join(map(str, self.poly.coef)))
         configfile.set(section, "model_domain", ",".join(map(str, self.poly.domain)))
         configfile.set(section, "model_range", "%f,%f" % (self.min_z, self.max_z))
         configfile.set(section, "model_temp", "%f" % (self.temp))
@@ -1964,7 +1984,7 @@ class ModelManager:
         name = gcmd.get("NAME", oldname)
         if name != oldname:
             model = copy.copy(model)
-            model.name = name
+        model.name = name
         model.save(self.beacon)
         if name != oldname:
             self.beacon.models[name] = model
@@ -2017,11 +2037,11 @@ class AlphaBetaFilter:
     def update(self, time, measurement):
         if self.xl is None:
             self.xl = measurement
-            if self.tl is not None:
-                dt = time - self.tl
-            else:
-                dt = 0
-            self.tl = time
+        if self.tl is not None:
+            dt = time - self.tl
+        else:
+            dt = 0
+        self.tl = time
         xk = self.xl + self.vl * dt
         vk = self.vl
         rk = measurement - xk
@@ -2042,9 +2062,11 @@ class StreamingHelper:
         self.cb = callback
         self.completion_cb = completion_callback
         self.completion = self.beacon.reactor.completion()
+
         self.latency_key = None
         if latency is not None:
             self.latency_key = self.beacon.request_stream_latency(latency)
+
         self.beacon._stream_callbacks[self] = self._handle
         self.beacon._start_streaming()
 
@@ -2079,22 +2101,6 @@ class StopStreaming(Exception):
     pass
 
 
-def prb_proberesult(beacon, test_pos):
-    (x, y, z) = beacon.get_offsets()
-    return manual_probe.ProbeResult(
-        test_pos[0] + x,
-        test_pos[1] + y,
-        test_pos[2] - z,
-        test_pos[0],
-        test_pos[1],
-        test_pos[2],
-    )
-
-
-def prb_identity(beacon, test_pos):
-    return test_pos
-
-
 class BeaconProbeWrapper:
     def __init__(self, beacon):
         self.beacon = beacon
@@ -2106,14 +2112,15 @@ class BeaconProbeWrapper:
     def multi_probe_end(self):
         return self.beacon.multi_probe_end()
 
-    def get_offsets(self):
+    def get_offsets(self, _gcmd=None):
         return self.beacon.get_offsets()
 
     def get_lift_speed(self, gcmd=None):
         return self.beacon.get_lift_speed(gcmd)
 
-    def run_probe(self, gcmd):
+    def run_probe(self, gcmd, *args, **kwargs):
         result = self.beacon.run_probe(gcmd)
+        result = self.beacon.compat_create_probe_result(result)
         if self.results is not None:
             self.results.append(result)
         return result
@@ -2136,7 +2143,7 @@ class BeaconProbeWrapper:
             return []
         else:
             self.results = []
-        return results
+            return results
 
     def get_status(self, eventtime):
         return {"name": "beacon"}
@@ -2157,16 +2164,15 @@ class BeaconTempWrapper:
         }
 
 
-TRSYNC_TIMEOUT = 0.025
-
-
 class BeaconEndstopShared:
     def __init__(self, beacon):
         self.beacon = beacon
+
         ffi_main, ffi_lib = chelper.get_ffi()
         self._trdispatch = ffi_main.gc(ffi_lib.trdispatch_alloc(), ffi_lib.free)
         self._trsync = MCU_trsync(self.beacon._mcu, self._trdispatch)
         self._trsyncs = [self._trsync]
+
         beacon.printer.register_event_handler(
             "klippy:mcu_identify", self._handle_mcu_identify
         )
@@ -2202,7 +2208,7 @@ class BeaconEndstopShared:
 
     def trsync_start(self, print_time):
         self._trigger_completion = self.beacon.reactor.completion()
-        expire_timeout = TRSYNC_TIMEOUT
+        expire_timeout = self.beacon.trsync_timeout
         for i, trsync in enumerate(self._trsyncs):
             try:
                 trsync.start(print_time, self._trigger_completion, expire_timeout)
@@ -2213,7 +2219,6 @@ class BeaconEndstopShared:
                 )
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_start(self._trdispatch, self._trsync.REASON_HOST_REQUEST)
-        return self._trigger_completion
 
     def trsync_stop(self, home_end_time):
         self._trsync.set_home_end_time(home_end_time)
@@ -2235,6 +2240,7 @@ class BeaconEndstopWrapper:
     def __init__(self, beacon):
         self.beacon = beacon
         self._shared = beacon._endstop_shared
+
         printer = beacon.printer
         printer.register_event_handler(
             "homing:home_rails_begin", self._handle_home_rails_begin
@@ -2242,6 +2248,7 @@ class BeaconEndstopWrapper:
         printer.register_event_handler(
             "homing:home_rails_end", self._handle_home_rails_end
         )
+
         self.is_homing = False
 
     def _handle_home_rails_begin(self, homing_state, rails):
@@ -2250,8 +2257,10 @@ class BeaconEndstopWrapper:
     def _handle_home_rails_end(self, homing_state, rails):
         if self.beacon.model is None:
             return
+
         if not self.is_homing:
             return
+
         if 2 not in homing_state.get_axes():
             return
 
@@ -2279,10 +2288,13 @@ class BeaconEndstopWrapper:
     ):
         if self.beacon.model is None:
             raise self.beacon.printer.command_error("No Beacon model loaded")
+
         self.is_homing = True
         self.beacon._apply_threshold()
         self.beacon._sample_async()
+
         self._shared.trsync_start(print_time)
+
         etrsync = self._shared._trsync
         self.beacon.beacon_home_cmd.send(
             [
@@ -2318,6 +2330,7 @@ class BeaconContactEndstopWrapper:
     def __init__(self, beacon, config):
         self.beacon = beacon
         self._shared = beacon._endstop_shared
+
         gcode_macro = beacon.printer.load_object(config, "gcode_macro")
         self.activate_gcode = gcode_macro.load_template(
             config, "contact_activate_gcode", ""
@@ -2348,6 +2361,7 @@ class BeaconContactEndstopWrapper:
                     "Current hotend temperature %.1f exceeds maximum allowed temperature %.1f"
                     % (cur_temp, self.max_hotend_temp)
                 )
+
         self.is_homing = True
         self.beacon._sample_async()
         self._shared.trsync_start(print_time)
@@ -2392,19 +2406,1499 @@ class BeaconContactEndstopWrapper:
                 time = self.beacon._clock32_to_time(ret["detect_clock"])
                 ffi_main, ffi_lib = chelper.get_ffi()
                 data = ffi_main.new("struct pull_move[1]")
-                count = ffi_lib.trapq_extract_old(
-                    self.beacon.trapq, data, 1, 0.0, time
-                )
-                if count != 1:
-                    raise self.beacon.printer.command_error(
-                        "Unexpected trapq count in contact home"
-                    )
-                return time
+                count = ffi_lib.trapq_extract_old(self.beacon.trapq, data, 1, 0.0, time)
+                if time >= home_end_time:
+                    return 0.0
+                if count:
+                    accel = data[0].accel
+                    if accel < 0:
+                        logging.info("Contact triggered while decelerating")
+                        raise self.beacon.printer.command_error(
+                            "No trigger on probe after full movement"
+                        )
+                    elif accel > 0:
+                        raise self.beacon.printer.command_error(
+                            "Contact triggered while accelerating"
+                        )
+                    return time
         finally:
             self.beacon.beacon_contact_stop_home_cmd.send()
 
     def query_endstop(self, print_time):
         return 0
+
+    def get_position_endstop(self):
+        return 0
+
+
+HOMING_AUTOCAL_CALIBRATE_ALWAYS = 0
+HOMING_AUTOCAL_CALIBRATE_UNHOMED = 1
+HOMING_AUTOCAL_CALIBRATE_NEVER = 2
+HOMING_AUTOCAL_CALIBRATE_CHOICES = {
+    "always": HOMING_AUTOCAL_CALIBRATE_ALWAYS,
+    "unhomed": HOMING_AUTOCAL_CALIBRATE_UNHOMED,
+    "never": HOMING_AUTOCAL_CALIBRATE_NEVER,
+}
+HOMING_AUTOCAL_METHOD_CONTACT = 0
+HOMING_AUTOCAL_METHOD_PROXIMITY = 1
+HOMING_AUTOCAL_METHOD_PROXIMITY_IF_AVAILABLE = 2
+HOMING_AUTOCAL_METHOD_CHOICES = {
+    "contact": HOMING_AUTOCAL_METHOD_CONTACT,
+    "proximity": HOMING_AUTOCAL_METHOD_PROXIMITY,
+    "proximity_if_available": HOMING_AUTOCAL_METHOD_PROXIMITY_IF_AVAILABLE,
+}
+HOMING_AUTOCAL_CHOICES_METHOD = {v: k for k, v in HOMING_AUTOCAL_METHOD_CHOICES.items()}
+
+
+class BeaconHomingHelper:
+    @classmethod
+    def create(cls, beacon, config):
+        home_xy_position = config.getfloatlist("home_xy_position", None, count=2)
+        if home_xy_position is None:
+            return None
+        return BeaconHomingHelper(beacon, config, home_xy_position)
+
+    def __init__(self, beacon, config, home_xy_position):
+        self.beacon = beacon
+        self.home_pos = home_xy_position
+
+        for section in ["safe_z_home", "homing_override"]:
+            if config.has_section(section):
+                raise config.error(
+                    "home_xy_position cannot be used with [%s]" % (section,)
+                )
+
+        self.z_hop = config.getfloat("home_z_hop", 0.0)
+        self.z_hop_speed = config.getfloat("home_z_hop_speed", 15.0, above=0.0)
+        self.xy_move_speed = config.getfloat("home_xy_move_speed", 50.0, above=0.0)
+        self.home_y_before_x = config.getboolean("home_y_before_x", False)
+        self.method = config.getchoice(
+            "home_method", HOMING_AUTOCAL_METHOD_CHOICES, "proximity"
+        )
+        self.method_when_homed = config.getchoice(
+            "home_method_when_homed",
+            HOMING_AUTOCAL_METHOD_CHOICES,
+            HOMING_AUTOCAL_CHOICES_METHOD[self.method],
+        )
+        self.autocal_create_model = config.getchoice(
+            "home_autocalibrate", HOMING_AUTOCAL_CALIBRATE_CHOICES, "always"
+        )
+
+        gcode_macro = beacon.printer.load_object(config, "gcode_macro")
+        self.tmpl_pre_xy = gcode_macro.load_template(config, "home_gcode_pre_xy", "")
+        self.tmpl_post_xy = gcode_macro.load_template(config, "home_gcode_post_xy", "")
+        self.tmpl_pre_x = gcode_macro.load_template(config, "home_gcode_pre_x", "")
+        self.tmpl_post_x = gcode_macro.load_template(config, "home_gcode_post_x", "")
+        self.tmpl_pre_y = gcode_macro.load_template(config, "home_gcode_pre_y", "")
+        self.tmpl_post_y = gcode_macro.load_template(config, "home_gcode_post_y", "")
+        self.tmpl_pre_z = gcode_macro.load_template(config, "home_gcode_pre_z", "")
+        self.tmpl_post_z = gcode_macro.load_template(config, "home_gcode_post_z", "")
+
+        # Ensure homing is loaded so we can override G28
+        beacon.printer.load_object(config, "homing")
+        self.gcode = gcode = beacon.gcode
+        self.prev_gcmd = gcode.register_command("G28", None)
+        gcode.register_command("G28", self.cmd_G28)
+
+    def _maybe_zhop(self, toolhead):
+        if self.z_hop != 0:
+            curtime = self.beacon.reactor.monotonic()
+            kin = toolhead.get_kinematics()
+            kin_status = kin.get_status(curtime)
+            pos = toolhead.get_position()
+
+            move = [None, None, self.z_hop]
+            if "z" not in kin_status["homed_axes"]:
+                pos[2] = 0
+                self.beacon.compat_toolhead_set_position_homing_z(toolhead, pos)
+                toolhead.manual_move(move, self.z_hop_speed)
+                toolhead.wait_moves()
+                self.beacon.compat_kin_note_z_not_homed(kin)
+            elif pos[2] < self.z_hop:
+                toolhead.manual_move(move, self.z_hop_speed)
+                toolhead.wait_moves()
+
+    def _run_hook(self, template, params, raw_params):
+        ctx = template.create_template_context()
+        ctx["params"] = params
+        ctx["rawparams"] = raw_params
+        template.run_gcode_from_command(ctx)
+
+    def cmd_G28(self, gcmd):
+        toolhead = self.beacon.printer.lookup_object("toolhead")
+        orig_params = gcmd.get_command_parameters()
+        raw_params = gcmd.get_raw_command_parameters()
+
+        self._maybe_zhop(toolhead)
+
+        want_x, want_y, want_z = [gcmd.get(a, None) is not None for a in "XYZ"]
+        # No axes given => home them all
+        if not (want_x or want_y or want_z):
+            want_x = want_y = want_z = True
+
+        if want_x or want_y:
+            self._run_hook(self.tmpl_pre_xy, orig_params, raw_params)
+            if self.home_y_before_x:
+                axis_order = "yx"
+            else:
+                axis_order = "xy"
+            for axis in axis_order:
+                if axis == "x" and want_x:
+                    self._run_hook(self.tmpl_pre_x, orig_params, raw_params)
+                    cmd = self.gcode.create_gcode_command("G28", "G28", {"X": "0"})
+                    self.prev_gcmd(cmd)
+                    self._run_hook(self.tmpl_post_x, orig_params, raw_params)
+                elif axis == "y" and want_y:
+                    self._run_hook(self.tmpl_pre_y, orig_params, raw_params)
+                    cmd = self.gcode.create_gcode_command("G28", "G28", {"Y": "0"})
+                    self.prev_gcmd(cmd)
+                    self._run_hook(self.tmpl_post_y, orig_params, raw_params)
+            self._run_hook(self.tmpl_post_xy, orig_params, raw_params)
+
+        if want_z:
+            self._run_hook(self.tmpl_pre_z, orig_params, raw_params)
+            curtime = self.beacon.reactor.monotonic()
+            kin = toolhead.get_kinematics()
+            kin_status = kin.get_status(curtime)
+            if "xy" not in kin_status["homed_axes"]:
+                raise gcmd.error("Must home X and Y axes before homing Z")
+
+            method = self.method
+            if "z" in kin_status["homed_axes"]:
+                method = self.method_when_homed
+
+            # G28 is not normally an extended gcode, so we need this hack
+            args = gcmd.get_commandline().split(" ")
+            for arg in args:
+                kv = arg.split("=")
+                if len(kv) == 2 and kv[0].strip().lower() == "method":
+                    method = HOMING_AUTOCAL_METHOD_CHOICES.get(
+                        kv[1].strip().lower(), None
+                    )
+                    if method is None:
+                        raise gcmd.error(
+                            "Invalid homing method, valid choices: proximity, proximity_if_available, contact"
+                        )
+                    break
+
+            pos = [self.home_pos[0], self.home_pos[1]]
+
+            if method == HOMING_AUTOCAL_METHOD_PROXIMITY_IF_AVAILABLE:
+                if self.beacon.model is not None:
+                    method = HOMING_AUTOCAL_METHOD_PROXIMITY
+                else:
+                    method = HOMING_AUTOCAL_METHOD_CONTACT
+
+            if method == HOMING_AUTOCAL_METHOD_CONTACT:
+                toolhead.manual_move(pos, self.xy_move_speed)
+
+                calibrate = True
+                if self.autocal_create_model == HOMING_AUTOCAL_CALIBRATE_UNHOMED:
+                    calibrate = "z" not in kin_status["homed_axes"]
+                elif self.autocal_create_model == HOMING_AUTOCAL_CALIBRATE_NEVER:
+                    calibrate = False
+
+                override = gcmd.get("CALIBRATE", None)
+                if override is not None:
+                    if override.lower() in ["=0", "=no", "=false"]:
+                        calibrate = False
+                    else:
+                        calibrate = True
+
+                cmd = "BEACON_AUTO_CALIBRATE"
+                params = {}
+                if not calibrate:
+                    params["SKIP_MODEL_CREATION"] = "1"
+                cmd = self.gcode.create_gcode_command(cmd, cmd, params)
+                self.beacon.cmd_BEACON_AUTO_CALIBRATE(cmd)
+            elif method == HOMING_AUTOCAL_METHOD_PROXIMITY:
+                pos[0] -= self.beacon.x_offset
+                pos[1] -= self.beacon.y_offset
+                toolhead.manual_move(pos, self.xy_move_speed)
+                cmd = self.gcode.create_gcode_command("G28", "G28", {"Z": "0"})
+                self.prev_gcmd(cmd)
+            else:
+                raise gcmd.error("Invalid homing method '%s'" % (method,))
+            self._maybe_zhop(toolhead)
+            self._run_hook(self.tmpl_post_z, orig_params, raw_params)
+
+
+class BeaconHomingState:
+    def get_axes(self):
+        return [2]
+
+    def get_trigger_position(self, stepper_name):
+        raise Exception("get_trigger_position not supported")
+
+    def set_stepper_adjustment(self, stepper_name, adjustment):
+        pass
+
+    def set_homed_position(self, pos):
+        pass
+
+
+class BeaconMeshHelper:
+    @classmethod
+    def create(cls, beacon, config):
+        if config.has_section("bed_mesh"):
+            mesh_config = config.getsection("bed_mesh")
+            if mesh_config.get("mesh_radius", None) is not None:
+                return None  # Use normal bed meshing for round beds
+            return BeaconMeshHelper(beacon, config, mesh_config)
+        else:
+            return None
+
+    def __init__(self, beacon, config, mesh_config):
+        self.beacon = beacon
+        self.scipy = None
+        self.mesh_config = mesh_config
+        self.bm = self.beacon.printer.load_object(mesh_config, "bed_mesh")
+
+        self.speed = mesh_config.getfloat("speed", 50.0, above=0.0, note_valid=False)
+        self.def_min_x, self.def_min_y = mesh_config.getfloatlist(
+            "mesh_min", count=2, note_valid=False
+        )
+        self.def_max_x, self.def_max_y = mesh_config.getfloatlist(
+            "mesh_max", count=2, note_valid=False
+        )
+
+        if self.def_min_x > self.def_max_x:
+            self.def_min_x, self.def_max_x = self.def_max_x, self.def_min_x
+        if self.def_min_y > self.def_max_y:
+            self.def_min_y, self.def_max_y = self.def_max_y, self.def_min_y
+
+        self.def_res_x, self.def_res_y = mesh_config.getintlist(
+            "probe_count", count=2, note_valid=False
+        )
+        self.rri = mesh_config.getint(
+            "relative_reference_index", None, note_valid=False
+        )
+        self.zero_ref_pos = mesh_config.getfloatlist(
+            "zero_reference_position", None, count=2
+        )
+        self.zero_ref_pos_cluster_size = config.getfloat(
+            "zero_reference_cluster_size", 1, minval=0
+        )
+        self.dir = config.getchoice(
+            "mesh_main_direction", {"x": "x", "X": "x", "y": "y", "Y": "y"}, "y"
+        )
+        self.overscan = config.getfloat("mesh_overscan", -1, minval=0)
+        self.cluster_size = config.getfloat("mesh_cluster_size", 1, minval=0)
+        self.runs = config.getint("mesh_runs", 1, minval=1)
+        self.adaptive_margin = mesh_config.getfloat(
+            "adaptive_margin", 0, note_valid=False
+        )
+
+        contact_def_min = config.getfloatlist(
+            "contact_mesh_min",
+            default=None,
+            count=2,
+        )
+        contact_def_max = config.getfloatlist(
+            "contact_mesh_max",
+            default=None,
+            count=2,
+        )
+
+        xo = self.beacon.x_offset
+        yo = self.beacon.y_offset
+
+        def_contact_min = contact_def_min
+        if contact_def_min is None:
+            def_contact_min = (
+                max(self.def_min_x - xo, self.def_min_x),
+                max(self.def_min_y - yo, self.def_min_y),
+            )
+
+        def_contact_max = contact_def_max
+        if contact_def_max is None:
+            def_contact_max = (
+                min(self.def_max_x - xo, self.def_max_x),
+                min(self.def_max_y - yo, self.def_max_y),
+            )
+
+        min_x = def_contact_min[0]
+        max_x = def_contact_max[0]
+        min_y = def_contact_min[1]
+        max_y = def_contact_max[1]
+        self.def_contact_min = (min(min_x, max_x), min(min_y, max_y))
+        self.def_contact_max = (max(min_x, max_x), max(min_y, max_y))
+
+        if self.zero_ref_pos is not None and self.rri is not None:
+            logging.info(
+                "beacon: both 'zero_reference_position' and "
+                "'relative_reference_index' options are specified. The"
+                " former will be used"
+            )
+
+        self.faulty_regions = []
+        for i in list(range(1, 100, 1)):
+            start = mesh_config.getfloatlist(
+                "faulty_region_%d_min" % (i,), None, count=2
+            )
+            if start is None:
+                break
+            end = mesh_config.getfloatlist("faulty_region_%d_max" % (i,), count=2)
+            x_min = min(start[0], end[0])
+            x_max = max(start[0], end[0])
+            y_min = min(start[1], end[1])
+            y_max = max(start[1], end[1])
+            self.faulty_regions.append(Region(x_min, x_max, y_min, y_max))
+
+        self.exclude_object = None
+        beacon.printer.register_event_handler("klippy:connect", self._handle_connect)
+
+        self.gcode = beacon.gcode
+        self.prev_gcmd = self.gcode.register_command("BED_MESH_CALIBRATE", None)
+        self.gcode.register_command(
+            "BED_MESH_CALIBRATE",
+            self.cmd_BED_MESH_CALIBRATE,
+            desc=self.cmd_BED_MESH_CALIBRATE_help,
+        )
+
+    cmd_BED_MESH_CALIBRATE_help = "Perform Mesh Bed Leveling"
+
+    def cmd_BED_MESH_CALIBRATE(self, gcmd):
+        method = gcmd.get("METHOD", "beacon").lower()
+        probe_method = gcmd.get(
+            "PROBE_METHOD", self.beacon.default_probe_method
+        ).lower()
+        if probe_method != "proximity":
+            method = "automatic"
+        if method == "beacon":
+            self.calibrate(gcmd)
+        else:
+            # For backwards compatibility, ZRP is specified in probe coordinates.
+            # When in contact mode, we need to remove the offset first
+            if hasattr(self.bm.bmc, "zero_ref_pos"):
+                zrp = self.zero_ref_pos
+                if zrp is not None and probe_method == "contact":
+                    zrp = (zrp[0] + self.beacon.x_offset, zrp[1] + self.beacon.y_offset)
+                self.bm.bmc.zero_ref_pos = zrp
+            # In contact mode, clamp MESH_MIN and MESH_MAX in case they aren't given, to
+            # ensure the requested area is safe to probe. This results in a slightly smaller
+            # mesh but guarantees it can be processed.
+            if probe_method == "contact":
+                params = gcmd.get_command_parameters()
+                extra_params = {}
+                if "MESH_MIN" not in params:
+                    extra_params["MESH_MIN"] = ",".join(map(str, self.def_contact_min))
+                if "MESH_MAX" not in params:
+                    extra_params["MESH_MAX"] = ",".join(map(str, self.def_contact_max))
+                if extra_params:
+                    extra_params.update(params)
+                    gcmd = self.gcode.create_gcode_command(
+                        gcmd.get_command(),
+                        gcmd.get_commandline()
+                        + "".join([" " + k + "=" + v for k, v in extra_params.items()]),
+                        extra_params,
+                    )
+            self.beacon._current_probe = probe_method
+            self.prev_gcmd(gcmd)
+
+    def _handle_connect(self):
+        self.exclude_object = self.beacon.printer.lookup_object("exclude_object", None)
+
+        if self.overscan < 0:
+            # Auto determine a safe overscan amount
+            toolhead = self.beacon.printer.lookup_object("toolhead")
+            curtime = self.beacon.reactor.monotonic()
+            status = toolhead.get_kinematics().get_status(curtime)
+            xo = self.beacon.x_offset
+            yo = self.beacon.y_offset
+            settings = {
+                "x": {
+                    "range": [self.def_min_x - xo, self.def_max_x - xo],
+                    "machine": [status["axis_minimum"][0], status["axis_maximum"][0]],
+                    "count": self.def_res_y,
+                },
+                "y": {
+                    "range": [self.def_min_y - yo, self.def_max_y - yo],
+                    "machine": [status["axis_minimum"][1], status["axis_maximum"][1]],
+                    "count": self.def_res_x,
+                },
+            }[self.dir]
+
+            r = settings["range"]
+            m = settings["machine"]
+            space = (r[1] - r[0]) / (float(settings["count"] - 1))
+            self.overscan = min(
+                [
+                    max(0, r[0] - m[0]),
+                    max(0, m[1] - r[1]),
+                    space + 2.0,  # A half circle with 2mm lead in/out
+                ]
+            )
+
+    def _generate_path(self):
+        xo = self.beacon.x_offset
+        yo = self.beacon.y_offset
+        settings = {
+            "x": {
+                "range_aligned": [self.min_x - xo, self.max_x - xo],
+                "range_perpendicular": [self.min_y - yo, self.max_y - yo],
+                "count": self.res_y,
+                "swap_coord": False,
+            },
+            "y": {
+                "range_aligned": [self.min_y - yo, self.max_y - yo],
+                "range_perpendicular": [self.min_x - xo, self.max_x - xo],
+                "count": self.res_x,
+                "swap_coord": True,
+            },
+        }[self.dir]
+
+        # We build the path in "normalized" coordinates and then simply
+        # swap x and y at the end if we need to
+        begin_a, end_a = settings["range_aligned"]
+        begin_p, end_p = settings["range_perpendicular"]
+        swap_coord = settings["swap_coord"]
+        step = (end_p - begin_p) / (float(settings["count"] - 1))
+        points = []
+        corner_radius = min(step / 2, self.overscan)
+        for i in range(0, settings["count"]):
+            pos_p = begin_p + step * i
+            even = i % 2 == 0  # If even we are going 'right', else 'left'
+            pa = (begin_a, pos_p) if even else (end_a, pos_p)
+            pb = (end_a, pos_p) if even else (begin_a, pos_p)
+
+            line = (pa, pb)
+
+            if len(points) > 0 and corner_radius > 0:
+                # We need to insert an overscan corner. Basically we insert
+                # a rounded rectangle to smooth out the transition and retain
+                # as much speed as we can.
+                #
+                #  ---|---<
+                # /
+                # |
+                # \
+                #  ---|--->
+                #
+                # We just need to draw the two 90 degree arcs. They contain
+                # the endpoints of the lines connecting everything.
+                if even:
+                    center = begin_a - self.overscan + corner_radius
+                    points += arc_points(
+                        center, pos_p - step + corner_radius, corner_radius, -90, -90
+                    )
+                    points += arc_points(
+                        center, pos_p - corner_radius, corner_radius, -180, -90
+                    )
+                else:
+                    center = end_a + self.overscan - corner_radius
+                    points += arc_points(
+                        center, pos_p - step + corner_radius, corner_radius, -90, 90
+                    )
+                    points += arc_points(
+                        center, pos_p - corner_radius, corner_radius, 0, 90
+                    )
+
+            points.append(line[0])
+            points.append(line[1])
+
+        if swap_coord:
+            for i in range(len(points)):
+                (x, y) = points[i]
+                points[i] = (y, x)
+
+        return points
+
+    def calibrate(self, gcmd):
+        use_full = gcmd.get_int("USE_CONTACT_AREA", 0) == 0
+        self.min_x, self.min_y = coord_fallback(
+            gcmd,
+            "MESH_MIN",
+            float_parse,
+            self.def_min_x if use_full else self.def_contact_min[0],
+            self.def_min_y if use_full else self.def_contact_min[1],
+            lambda v, d: max(v, d),
+        )
+        self.max_x, self.max_y = coord_fallback(
+            gcmd,
+            "MESH_MAX",
+            float_parse,
+            self.def_max_x if use_full else self.def_contact_max[0],
+            self.def_max_y if use_full else self.def_contact_max[1],
+            lambda v, d: min(v, d),
+        )
+        self.res_x, self.res_y = coord_fallback(
+            gcmd,
+            "PROBE_COUNT",
+            int,
+            self.def_res_x,
+            self.def_res_y,
+            lambda v, _d: max(v, 3),
+        )
+        self.profile_name = gcmd.get("PROFILE", "default")
+
+        if self.min_x > self.max_x:
+            self.min_x, self.max_x = (
+                max(self.max_x, self.def_min_x),
+                min(self.min_x, self.def_max_x),
+            )
+        if self.min_y > self.max_y:
+            self.min_y, self.max_y = (
+                max(self.max_y, self.def_min_y),
+                min(self.min_y, self.def_max_y),
+            )
+
+        # If the user gave RRI _on gcode_ then use it, else use zero_ref_pos
+        # if we have it, and finally use config RRI if we have it.
+        rri = gcmd.get_int("RELATIVE_REFERENCE_INDEX", None)
+        if rri is not None:
+            self.zero_ref_mode = ("rri", rri)
+        elif self.zero_ref_pos is not None:
+            self.zero_ref_mode = ("pos", self.zero_ref_pos)
+            self.zero_ref_val = None
+            self.zero_ref_bin = []
+        elif self.rri is not None:
+            self.zero_ref_mode = ("rri", self.rri)
+        else:
+            self.zero_ref_mode = None
+
+        # If the user requested adaptive meshing, try to shrink the values we just configured
+        if gcmd.get_int("ADAPTIVE", 0):
+            if self.exclude_object is not None:
+                margin = gcmd.get_float("ADAPTIVE_MARGIN", self.adaptive_margin)
+                self._shrink_to_excluded_objects(gcmd, margin)
+            else:
+                gcmd.respond_info(
+                    "Requested adaptive mesh, but [exclude_object] is not enabled. Ignoring."
+                )
+
+        self.step_x = (self.max_x - self.min_x) / (self.res_x - 1)
+        self.step_y = (self.max_y - self.min_y) / (self.res_y - 1)
+
+        self.toolhead = self.beacon.toolhead
+        path = self._generate_path()
+
+        probe_speed = gcmd.get_float("PROBE_SPEED", self.beacon.speed, above=0.0)
+        self.beacon._move_to_probing_height(probe_speed)
+
+        speed = gcmd.get_float("SPEED", self.speed, above=0.0)
+        runs = gcmd.get_int("RUNS", self.runs, minval=1)
+
+        try:
+            self.beacon._start_streaming()
+
+            # Move to first location
+            (x, y) = path[0]
+            self.toolhead.manual_move([x, y, None], speed)
+            self.toolhead.wait_moves()
+
+            self.beacon._sample_printtime_sync(5)
+            clusters = self._sample_mesh(gcmd, path, speed, runs)
+
+            if self.zero_ref_mode and self.zero_ref_mode[0] == "pos":
+                # If we didn't collect anything, hop over to the zero point
+                # and sample. Otherwise, grab the median of what we collected.
+                if len(self.zero_ref_bin) == 0:
+                    self._collect_zero_ref(speed, self.zero_ref_mode[1])
+                else:
+                    self.zero_ref_val = median(self.zero_ref_bin)
+
+        finally:
+            self.beacon._stop_streaming()
+
+        matrix = self._process_clusters(clusters, gcmd)
+        self._apply_mesh(matrix, gcmd)
+
+    def _shrink_to_excluded_objects(self, gcmd, margin):
+        bound_min_x, bound_max_x = None, None
+        bound_min_y, bound_max_y = None, None
+        objects = self.exclude_object.get_status().get("objects", {})
+        if len(objects) == 0:
+            return
+
+        for obj in objects:
+            for point in obj["polygon"]:
+                bound_min_x = opt_min(bound_min_x, point[0])
+                bound_max_x = opt_max(bound_max_x, point[0])
+                bound_min_y = opt_min(bound_min_y, point[1])
+                bound_max_y = opt_max(bound_max_y, point[1])
+        bound_min_x -= margin
+        bound_max_x += margin
+        bound_min_y -= margin
+        bound_max_y += margin
+
+        # Calculate original step size and apply the new bounds
+        orig_span_x = self.max_x - self.min_x
+        orig_span_y = self.max_y - self.min_y
+
+        if bound_min_x >= self.min_x:
+            self.min_x = bound_min_x
+        if bound_max_x <= self.max_x:
+            self.max_x = bound_max_x
+        if bound_min_y >= self.min_y:
+            self.min_y = bound_min_y
+        if bound_max_y <= self.max_y:
+            self.max_y = bound_max_y
+
+        # Update resolution to retain approximately the same step size as before
+        self.res_x = int(
+            math.ceil(self.res_x * (self.max_x - self.min_x) / orig_span_x)
+        )
+        self.res_y = int(
+            math.ceil(self.res_y * (self.max_y - self.min_y) / orig_span_y)
+        )
+        # Guard against bicubic interpolation with 3 points on one axis
+        min_res = 3
+        if max(self.res_x, self.res_y) > 6 and min(self.res_x, self.res_y) < 4:
+            min_res = 4
+        self.res_x = max(self.res_x, min_res)
+        self.res_y = max(self.res_y, min_res)
+
+        self.profile_name = None
+
+    def _fly_path(self, path, speed, runs):
+        # Run through the path
+        for i in range(runs):
+            p = path if i % 2 == 0 else reversed(path)
+            for x, y in p:
+                self.toolhead.manual_move([x, y, None], speed)
+        self.toolhead.dwell(0.251)
+        self.toolhead.wait_moves()
+
+    def _collect_zero_ref(self, speed, coord):
+        xo, yo = self.beacon.x_offset, self.beacon.y_offset
+        (x, y) = coord
+        self.toolhead.manual_move([x - xo, y - yo, None], speed)
+        (dist, _samples) = self.beacon._sample(50, 10)
+        self.zero_ref_val = dist
+
+    def _is_valid_position(self, x, y):
+        return self.min_x <= x <= self.max_x and self.min_y <= y <= self.min_y
+
+    def _is_faulty_coordinate(self, x, y, add_offsets=False):
+        if add_offsets:
+            xo, yo = self.beacon.x_offset, self.beacon.y_offset
+            x += xo
+            y += yo
+        for r in self.faulty_regions:
+            if r.is_point_within(x, y):
+                return True
+        return False
+
+    def _sample_mesh(self, gcmd, path, speed, runs):
+        cs = gcmd.get_float("CLUSTER_SIZE", self.cluster_size, minval=0.0)
+        zcs = self.zero_ref_pos_cluster_size
+        if not (self.zero_ref_mode and self.zero_ref_mode[0] == "pos"):
+            zcs = 0
+
+        min_x, min_y = self.min_x, self.min_y
+        xo, yo = self.beacon.x_offset, self.beacon.y_offset
+
+        clusters = {}
+        total_samples = [0]
+        invalid_samples = [0]
+
+        def cb(sample):
+            total_samples[0] += 1
+            d = sample["dist"]
+            (x, y, z) = sample["pos"][:3]
+            x += xo
+            y += yo
+
+            if d is None or math.isinf(d):
+                if self._is_valid_position(x, y):
+                    invalid_samples[0] += 1
+                return
+
+            # Calculate coordinate of the cluster we are in
+            xi = int(round((x - min_x) / self.step_x))
+            yi = int(round((y - min_y) / self.step_y))
+            if xi < 0 or self.res_x <= xi or yi < 0 or self.res_y <= yi:
+                return
+
+            # If there's a cluster size limit, apply it here
+            if cs > 0:
+                xf = xi * self.step_x + min_x
+                yf = yi * self.step_y + min_y
+                dx = x - xf
+                dy = y - yf
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > cs:
+                    return
+
+            # If we are looking for a zero reference, check if we
+            # are close enough and if so, add to the bin.
+            if zcs > 0:
+                dx = x - self.zero_ref_mode[1][0]
+                dy = y - self.zero_ref_mode[1][1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist <= zcs:
+                    self.zero_ref_bin.append(d)
+
+            k = (xi, yi)
+
+            if k not in clusters:
+                clusters[k] = []
+            clusters[k].append(d)
+
+        with self.beacon.streaming_session(cb):
+            self._fly_path(path, speed, runs)
+
+        gcmd.respond_info(
+            "Sampled %d total points over %d runs" % (total_samples[0], runs)
+        )
+        if invalid_samples[0]:
+            gcmd.respond_info(
+                "!! Encountered %d invalid samples!" % (invalid_samples[0],)
+            )
+        gcmd.respond_info("Samples binned in %d clusters" % (len(clusters),))
+
+        return clusters
+
+    def _process_clusters(self, raw_clusters, gcmd):
+        parent_conn, child_conn = multiprocessing.Pipe()
+        dump_file = gcmd.get("FILENAME", None)
+
+        def do():
+            try:
+                child_conn.send(
+                    (False, self._do_process_clusters(raw_clusters, dump_file))
+                )
+            except Exception:
+                child_conn.send((True, traceback.format_exc()))
+            child_conn.close()
+
+        child = multiprocessing.Process(target=do)
+        child.daemon = True
+        child.start()
+        reactor = self.beacon.reactor
+        eventtime = reactor.monotonic()
+        while child.is_alive():
+            eventtime = reactor.pause(eventtime + 0.1)
+        is_err, result = parent_conn.recv()
+        child.join()
+        parent_conn.close()
+        if is_err:
+            raise Exception("Error processing mesh: %s" % (result,))
+        else:
+            is_inner_err, inner_result = result
+            if is_inner_err:
+                raise gcmd.error(inner_result)
+            else:
+                return inner_result
+
+    def _do_process_clusters(self, raw_clusters, dump_file):
+        if dump_file:
+            with open(dump_file, "w") as f:
+                f.write("x,y,xp,xy,dist\n")
+                for yi in range(self.res_y):
+                    for xi in range(self.res_x):
+                        cluster = raw_clusters.get((xi, yi), [])
+                        xp = xi * self.step_x + self.min_x
+                        yp = yi * self.step_y + self.min_y
+                        for dist in cluster:
+                            f.write("%d,%d,%f,%f,%f\n" % (xi, yi, xp, yp, dist))
+
+        mask = self._generate_fault_mask()
+        matrix, faulty_regions = self._generate_matrix(raw_clusters, mask)
+        if len(faulty_regions) > 0:
+            (error, interpolator_or_msg) = self._load_interpolator()
+            if error:
+                return (True, interpolator_or_msg)
+            matrix = self._interpolate_faulty(
+                matrix, faulty_regions, interpolator_or_msg
+            )
+        err = self._check_matrix(matrix)
+        if err is not None:
+            return (True, err)
+        return (False, self._finalize_matrix(matrix))
+
+    def _generate_fault_mask(self):
+        if len(self.faulty_regions) == 0:
+            return None
+        mask = np.full((self.res_y, self.res_x), True)
+        for r in self.faulty_regions:
+            r_xmin = max(0, int(math.ceil((r.x_min - self.min_x) / self.step_x)))
+            r_ymin = max(0, int(math.ceil((r.y_min - self.min_y) / self.step_y)))
+            r_xmax = min(
+                self.res_x - 1, int(math.floor((r.x_max - self.min_x) / self.step_x))
+            )
+            r_ymax = min(
+                self.res_y - 1, int(math.floor((r.y_max - self.min_y) / self.step_y))
+            )
+            for y in range(r_ymin, r_ymax + 1):
+                for x in range(r_xmin, r_xmax + 1):
+                    mask[(y, x)] = False
+        return mask
+
+    def _generate_matrix(self, raw_clusters, mask):
+        faulty_indexes = []
+        matrix = np.empty((self.res_y, self.res_x))
+        for (x, y), values in raw_clusters.items():
+            if mask is None or mask[(y, x)]:
+                matrix[(y, x)] = self.beacon.trigger_distance - median(values)
+            else:
+                matrix[(y, x)] = np.nan
+                faulty_indexes.append((y, x))
+        return matrix, faulty_indexes
+
+    def _load_interpolator(self):
+        if not self.scipy:
+            try:
+                self.scipy = importlib.import_module("scipy")
+            except ImportError:
+                msg = (
+                    "Could not load `scipy`. To install it, simply re-run "
+                    "the Beacon `install.sh` script. This module is required "
+                    "when using faulty regions when bed meshing."
+                )
+                return (True, msg)
+        if hasattr(self.scipy.interpolate, "RBFInterpolator"):
+
+            def rbf_interp(points, values, faulty):
+                return self.scipy.interpolate.RBFInterpolator(points, values, 64)(
+                    faulty
+                )
+
+            return (False, rbf_interp)
+        else:
+
+            def linear_interp(points, values, faulty):
+                return self.scipy.interpolate.griddata(
+                    points, values, faulty, method="linear"
+                )
+
+    def _cluster_mean(self, data):
+        median_count = max(0, int(math.floor(len(data) / 6)))
+        return float(np.mean(np.sort(data)[median_count : len(data) - median_count]))
+
+    def _interpolate_faulty(self, matrix, faulty_indexes, interpolator):
+        ys, xs = np.mgrid[0 : matrix.shape[0], 0 : matrix.shape[1]]
+        points = np.array([ys.flatten(), xs.flatten()]).T
+        values = matrix.reshape(-1)
+        good = ~np.isnan(values)
+        fixed = interpolator(points[good], values[good], faulty_indexes)
+        matrix[tuple(np.array(faulty_indexes).T)] = fixed
+        return matrix
+
+    def _check_matrix(self, matrix):
+        empty_clusters = []
+        for yi in range(self.res_y):
+            for xi in range(self.res_x):
+                if np.isnan(matrix[(yi, xi)]):
+                    xc = xi * self.step_x + self.min_x
+                    yc = yi * self.step_y + self.min_y
+                    empty_clusters.append("  (%.3f,%.3f)[%d,%d]" % (xc, yc, xi, yi))
+        if empty_clusters:
+            err = (
+                "Empty clusters found\n"
+                "Try increasing mesh cluster_size or slowing down.\n"
+                "The following clusters were empty:\n"
+            ) + "\n".join(empty_clusters)
+            return err
+        else:
+            return None
+
+    def _finalize_matrix(self, matrix):
+        z_offset = None
+        if self.zero_ref_mode and self.zero_ref_mode[0] == "rri":
+            rri = self.zero_ref_mode[1]
+            if rri < 0 or rri >= self.res_x * self.res_y:
+                rri = None
+            if rri is not None:
+                rri_x = rri % self.res_x
+                rri_y = int(math.floor(rri / self.res_x))
+                z_offset = matrix[rri_y][rri_x]
+        elif self.zero_ref_mode and self.zero_ref_mode[0] == "pos":
+            z_offset = self.beacon.trigger_distance - self.zero_ref_val
+
+        if z_offset is not None:
+            matrix = matrix - z_offset
+        return matrix.tolist()
+
+    def _apply_mesh(self, matrix, gcmd):
+        params = self.bm.bmc.mesh_config.copy()
+        params["min_x"] = self.min_x
+        params["max_x"] = self.max_x
+        params["min_y"] = self.min_y
+        params["max_y"] = self.max_y
+        params["x_count"] = self.res_x
+        params["y_count"] = self.res_y
+        try:
+            mesh = bed_mesh.ZMesh(params)
+        except TypeError:
+            mesh = bed_mesh.ZMesh(params, self.profile_name)
+        try:
+            mesh.build_mesh(matrix)
+        except bed_mesh.BedMeshError as e:
+            raise self.gcode.error(str(e))
+        self.bm.set_mesh(mesh)
+        self.gcode.respond_info("Mesh calibration complete")
+        if self.profile_name is not None:
+            self.bm.save_profile(self.profile_name)
+
+
+class Region:
+    def __init__(self, x_min, x_max, y_min, y_max):
+        self.x_min = x_min
+        self.x_max = x_max
+        self.y_min = y_min
+        self.y_max = y_max
+
+    def is_point_within(self, x, y):
+        return (x > self.x_min and x < self.x_max) and (
+            y > self.y_min and y < self.y_max
+        )
+
+
+def arc_points(cx, cy, r, start_angle, span):
+    # Angle delta is determined by a max deviation(md) from 0.1mm:
+    #   r * versin(d_a) < md
+    #   versin(d_a) < md/r
+    #   d_a < arcversin(md/r)
+    #   d_a < arccos(1-md/r)
+    # We then determine how many of these we can fit in exactly
+    # 90 degrees(rounding up) and then determining the exact
+    # delta angle.
+    start_angle = start_angle / 180.0 * math.pi
+    span = span / 180.0 * math.pi
+    d_a = math.acos(1 - 0.1 / r)
+    cnt = int(math.ceil(abs(span) / d_a))
+    d_a = span / float(cnt)
+
+    points = []
+    for i in range(cnt + 1):
+        ang = start_angle + d_a * float(i)
+        x = cx + math.cos(ang) * r
+        y = cy + math.sin(ang) * r
+        points.append((x, y))
+
+    return points
+
+
+def coord_fallback(gcmd, name, parse, def_x, def_y, map=lambda v, d: v):
+    param = gcmd.get(name, None)
+    if param is not None:
+        try:
+            x, y = [parse(p.strip()) for p in param.split(",", 1)]
+            return map(x, def_x), map(y, def_y)
+        except Exception:
+            raise gcmd.error("Unable to parse parameter '%s'" % (name,))
+    else:
+        return def_x, def_y
+
+
+def float_parse(s):
+    v = float(s)
+    if math.isinf(v) or np.isnan(v):
+        raise ValueError("could not convert string to float: '%s'" % (s,))
+    return v
+
+
+def median(samples):
+    return float(np.median(samples))
+
+
+def opt_min(a, b):
+    if a is None:
+        return b
+    return min(a, b)
+
+
+def opt_max(a, b):
+    if a is None:
+        return b
+    return max(a, b)
+
+
+GRAVITY = 9.80655
+ACCEL_BYTES_PER_SAMPLE = 6
+
+Accel_Measurement = collections.namedtuple(
+    "Accel_Measurement", ("time", "accel_x", "accel_y", "accel_z")
+)
+
+
+class BeaconAccelDummyConfig(object):
+    def __init__(self, beacon, accel_config):
+        self.beacon = beacon
+        self.accel_config = accel_config
+
+    def get_name(self):
+        if self.beacon.id.is_unnamed():
+            return "beacon"
+        else:
+            return "beacon_" + self.beacon.id.name
+
+    def has_section(self, name):
+        if not self.beacon.id.is_unnamed():
+            return True
+        return name == "adxl345" and self.accel_config.adxl345_exists
+
+    def get_printer(self):
+        return self.beacon.printer
+
+
+class BeaconAccelConfig(object):
+    def __init__(self, config):
+        self.default_scale = config.get("accel_scale", "")
+        axes = {
+            "x": (0, 1),
+            "-x": (0, -1),
+            "y": (1, 1),
+            "-y": (1, -1),
+            "z": (2, 1),
+            "-z": (2, -1),
+        }
+        axes_map = config.getlist("accel_axes_map", ("x", "y", "z"), count=3)
+        self.axes_map = []
+        for a in axes_map:
+            a = a.strip()
+            if a not in axes:
+                raise config.error("Invalid accel_axes_map, unknown axes '%s'" % (a,))
+            self.axes_map.append(axes[a])
+
+        self.adxl345_exists = config.has_section("adxl345")
+
+
+class BeaconAccelHelper(object):
+    def __init__(self, beacon, config, constants):
+        self.beacon = beacon
+        self.config = config
+
+        self._api_dump = APIDumpHelper(
+            beacon.printer,
+            lambda: self._start_streaming() or True,
+            lambda _: self._stop_streaming(),
+            self._api_update,
+        )
+        beacon.id.register_endpoint("beacon/dump_accel", self._handle_req_dump)
+        adxl345.AccelCommandHelper(BeaconAccelDummyConfig(beacon, config), self)
+
+        self._stream_en = 0
+        self._raw_samples = []
+        self._last_raw_sample = (0, 0, 0)
+        self._sample_lock = threading.Lock()
+
+        beacon._mcu.register_response(self._handle_accel_data, "beacon_accel_data")
+        beacon._mcu.register_response(self._handle_accel_state, "beacon_accel_state")
+
+        self.reinit(constants)
+
+    def reinit(self, constants):
+        bits = constants.get("BEACON_ACCEL_BITS")
+        self._clip_values = (2 ** (bits - 1) - 1, -(2 ** (bits - 1)))
+
+        self.accel_stream_cmd = self.beacon._mcu.lookup_command(
+            "beacon_accel_stream en=%c scale=%c", cq=self.beacon.cmd_queue
+        )
+        # Ensure streaming mode is stopped
+        self.accel_stream_cmd.send([0, 0])
+
+        self._scales = self._fetch_scales(constants)
+        self._scale = self._select_scale()
+        logging.info("Selected Beacon accelerometer scale %s", self._scale["name"])
+
+    def _fetch_scales(self, constants):
+        enum = self.beacon._mcu.get_enumerations().get("beacon_accel_scales", None)
+        if enum is None:
+            return {}
+
+        scales = {}
+        self.default_scale_name = self.config.default_scale
+        first_scale_name = None
+        for name, id in enum.items():
+            try:
+                scale_val_name = "BEACON_ACCEL_SCALE_%s" % (name.upper(),)
+                scale_val_str = constants.get(scale_val_name)
+                scale_val = float(scale_val_str)
+            except Exception:
+                logging.error(
+                    "Beacon accelerometer scale %s could not be processed", name
+                )
+                scale_val = 1  # Values will be weird, but scale will work
+
+            if id == 0:
+                first_scale_name = name
+            scales[name] = {"name": name, "id": id, "scale": scale_val}
+
+        if not self.default_scale_name:
+            if first_scale_name is None:
+                logging.error("Could not determine default Beacon accelerometer scale")
+            else:
+                self.default_scale_name = first_scale_name
+        elif self.default_scale_name not in scales:
+            logging.error(
+                "Default Beacon accelerometer scale '%s' not found,  using '%s'",
+                self.default_scale_name,
+                first_scale_name,
+            )
+            self.default_scale_name = first_scale_name
+
+        return scales
+
+    def _select_scale(self):
+        scale = self._scales.get(self.default_scale_name, None)
+        if scale is None:
+            return {"name": "unknown", "id": 0, "scale": 1}
+        return scale
+
+    def _handle_accel_data(self, params):
+        with self._sample_lock:
+            if self._stream_en:
+                self._raw_samples.append(params)
+            else:
+                self.accel_stream_cmd.send([0, 0])
+
+    def _handle_accel_state(self, params):
+        pass
+
+    def _handle_req_dump(self, web_request):
+        cconn = self._api_dump.add_web_client(
+            web_request,
+            lambda buffer: list(
+                itertools.chain(*map(lambda data: data["data"], buffer))
+            ),
+        )
+        cconn.send({"header": ["time", "x", "y", "z"]})
+
+    # Internal helpers
+
+    def _start_streaming(self):
+        if self._stream_en == 0:
+            self._raw_samples = []
+            self.accel_stream_cmd.send([1, self._scale["id"]])
+        self._stream_en += 1
+
+    def _stop_streaming(self):
+        self._stream_en -= 1
+        if self._stream_en == 0:
+            self._raw_samples = []
+            self.accel_stream_cmd.send([0, 0])
+
+    def _process_samples(self, raw_samples, last_sample):
+        raw = last_sample
+        (xp, xs), (yp, ys), (zp, zs) = self.config.axes_map
+        scale = self._scale["scale"] * GRAVITY
+        xs, ys, zs = xs * scale, ys * scale, zs * scale
+
+        errors = 0
+        samples = []
+
+        def process_value(low, high, last_value):
+            raw = high << 8 | low
+            if raw == 0x7FFF:
+                # Clipped value
+                return self._clip_values[0 if last_value >= 0 else 1]
+            return raw - ((high & 0x80) << 9)
+
+        for sample in raw_samples:
+            tstart = self.beacon._clock32_to_time(sample["start_clock"])
+            tend = self.beacon._clock32_to_time(
+                sample["start_clock"] + sample["delta_clock"]
+            )
+            data = bytearray(sample["data"])
+            count = int(len(data) / ACCEL_BYTES_PER_SAMPLE)
+            dt = (tend - tstart) / (count - 1)
+            for idx in range(0, count):
+                base = idx * ACCEL_BYTES_PER_SAMPLE
+                d = data[base : base + ACCEL_BYTES_PER_SAMPLE]
+                dxl, dxh, dyl, dyh, dzl, dzh = d
+                raw = (
+                    process_value(dxl, dxh, raw[0]),
+                    process_value(dyl, dyh, raw[1]),
+                    process_value(dzl, dzh, raw[2]),
+                )
+                if raw[0] is None or raw[1] is None or raw[2] is None:
+                    errors += 1
+                    samples.append(None)
+                else:
+                    samples.append(
+                        (
+                            tstart + dt * idx,
+                            raw[xp] * xs,
+                            raw[yp] * ys,
+                            raw[zp] * zs,
+                        )
+                    )
+        return (samples, errors, raw)
+
+    # APIDumpHelper callbacks
+
+    def _api_update(self, dump_helper, eventtime):
+        with self._sample_lock:
+            raw_samples = self._raw_samples
+            self._raw_samples = []
+        (samples, errors, last_raw_sample) = self._process_samples(
+            raw_samples, self._last_raw_sample
+        )
+        if len(samples) == 0:
+            return
+        self._last_raw_sample = last_raw_sample
+        dump_helper.buffer.append(
+            {
+                "data": samples,
+                "errors": errors,
+                "overflows": 0,
+            }
+        )
+
+    # Accelerometer public interface
+
+    def start_internal_client(self):
+        cli = AccelInternalClient(self.beacon.printer)
+        self._api_dump.add_client(cli._handle_data)
+        return cli
+
+    def read_reg(self, reg):
+        raise self.beacon.printer.command_error("Not supported")
+
+    def set_reg(self, reg, val, minclock=0):
+        raise self.beacon.printer.command_error("Not supported")
+
+    def is_measuring(self):
+        return self._stream_en > 0
+
+
+class AccelInternalClient:
+    def __init__(self, printer):
+        self.printer = printer
+        self.toolhead = printer.lookup_object("toolhead")
+        self.is_finished = False
+        self.request_start_time = self.request_end_time = (
+            self.toolhead.get_last_move_time()
+        )
+        self.msgs = []
+        self.samples = []
+
+    def _handle_data(self, msgs):
+        if self.is_finished:
+            return False
+        if len(self.msgs) >= 10000:  # Limit capture length
+            return False
+        self.msgs.extend(msgs)
+        return True
+
+    # AccelQueryHelper interface
+
+    def finish_measurements(self):
+        self.request_end_time = self.toolhead.get_last_move_time()
+        self.toolhead.wait_moves()
+        self.is_finished = True
+
+    def has_valid_samples(self):
+        for msg in self.msgs:
+            data = msg["data"]
+            first_sample_time = data[0][0]
+            last_sample_time = data[-1][0]
+            if (
+                first_sample_time > self.request_end_time
+                or last_sample_time < self.request_start_time
+            ):
+                continue
+            return True
+        return False
+
+    def get_samples(self):
+        if not self.msgs:
+            return self.samples
+
+        total = sum([len(m["data"]) for m in self.msgs])
+        count = 0
+        self.samples = samples = [None] * total
+        for msg in self.msgs:
+            for samp_time, x, y, z in msg["data"]:
+                if samp_time < self.request_start_time:
+                    continue
+                if samp_time > self.request_end_time:
+                    break
+                samples[count] = Accel_Measurement(samp_time, x, y, z)
+                count += 1
+        del samples[count:]
+        return self.samples
+
+    def write_to_file(self, filename):
+        def do_write():
+            try:
+                os.nice(20)
+            except Exception:
+                pass
+            with open(filename, "w") as f:
+                f.write("#time,accel_x,accel_y,accel_z\n")
+                samples = self.samples or self.get_samples()
+                for t, accel_x, accel_y, accel_z in samples:
+                    f.write("%.6f,%.6f,%.6f,%.6f\n" % (t, accel_x, accel_y, accel_z))
+
+        write_proc = multiprocessing.Process(target=do_write)
+        write_proc.daemon = True
+        write_proc.start()
+
+
+class APIDumpHelper:
+    def __init__(self, printer, start, stop, update):
+        self.printer = printer
+        self.start = start
+        self.stop = stop
+        self.update = update
+        self.interval = 0.05
+        self.clients = []
+        self.stream = None
+        self.timer = None
+        self.buffer = []
+
+    def _start_stop(self):
+        if not self.stream and self.clients:
+            self.stream = self.start()
+            reactor = self.printer.get_reactor()
+            self.timer = reactor.register_timer(
+                self._process, reactor.monotonic() + self.interval
+            )
+        elif self.stream is not None and not self.clients:
+            self.stop(self.stream)
+            self.stream = None
+            self.printer.get_reactor().unregister_timer(self.timer)
+            self.timer = None
+
+    def _process(self, eventtime):
+        if self.update is not None:
+            self.update(self, eventtime)
+        if self.buffer:
+            for cb in list(self.clients):
+                if not cb(self.buffer):
+                    self.clients.remove(cb)
+                    self._start_stop()
+            self.buffer = []
+        return eventtime + self.interval
+
+    def add_client(self, client):
+        self.clients.append(client)
+        self._start_stop()
+
+    def add_web_client(self, web_request, formatter=lambda v: v):
+        cconn = web_request.get_client_connection()
+        template = web_request.get_dict("response_template", {})
+
+        def cb(items):
+            if cconn.is_closed():
+                return False
+            tmp = dict(template)
+            tmp["params"] = formatter(items)
+            cconn.send(tmp)
+            return True
+
+        self.add_client(cb)
+        return cconn
+
+
+class BeaconTracker:
+    def __init__(self, config, printer):
+        self.config = config
+        self.printer = printer
+        self.sensors = {}
+        self.gcodes = {}
+        self.endpoints = {}
+        self.gcode = printer.lookup_object("gcode")
+        self.webhooks = printer.lookup_object("webhooks")
+
+    def get_status(self, eventtime):
+        return {"sensors": list(self.sensors.keys())}
+
+    def home_dir(self):
+        return os.path.dirname(os.path.realpath(__file__))
+
+    def add_sensor(self, name):
+        if name is None:
+            cfg = self.config.getsection("beacon")
+        else:
+            if not name.islower():
+                raise self.config.error(
+                    "Beacon sensor name must be all lower case, sensor name '%s' is not valid"
+                    % (name,)
+                )
+            cfg = self.config.getsection("beacon sensor " + name)
+        self.sensors[name] = sensor = BeaconProbe(cfg, BeaconId(name, self))
+        if name is None:
+            self.printer.add_object("probe", BeaconProbeWrapper(sensor))
+        coil_name = "beacon_coil" if name is None else "beacon_%s_coil" % (name,)
+        temp = BeaconTempWrapper(sensor)
+        self.printer.add_object("temperature_sensor " + coil_name, temp)
+        pheaters = self.printer.load_object(self.config, "heaters")
+        pheaters.available_sensors.append("temperature_sensor " + coil_name)
+        return sensor
+
+    def get_or_add_sensor(self, name):
+        if name in self.sensors:
+            return self.sensors[name]
+        else:
+            return self.add_sensor(name)
+
+    def register_gcode_command(self, sensor, cmd, func, desc):
+        if cmd not in self.gcodes:
+            handlers = self.gcodes[cmd] = {}
+            self.gcode.register_command(
+                cmd, lambda gcmd: self.dispatch_gcode(handlers, gcmd), desc=desc
+            )
+        self.gcodes[cmd][sensor] = func
+
+    def dispatch_gcode(self, handlers, gcmd):
+        sensor = gcmd.get("SENSOR", "")
+        if sensor == "":
+            sensor = None
+        handler = handlers.get(sensor, None)
+        if not handler:
+            if sensor is None:
+                raise gcmd.error(
+                    "No default Beacon registered, provide SENSOR= option to select specific sensor."
+                )
+            else:
+                raise gcmd.error(
+                    "Requested sensor '%s' not found, specify a valid sensor."
+                    % (sensor,)
+                )
+        handler(gcmd)
+
+    def register_endpoint(self, sensor, path, callback):
+        if path not in self.endpoints:
+            self.webhooks.register_endpoint(path, self.dispatch_webhook)
+            self.endpoints[path] = {}
+        self.endpoints[path][sensor] = callback
+
+    def dispatch_webhook(self, req):
+        handlers = self.endpoints[req.method]
+        sensor = req.get("sensor", "")
+        if sensor == "":
+            sensor = None
+        handler = handlers.get(sensor, None)
+        if not handler:
+            if sensor is None:
+                raise req.error(
+                    "No default Beacon registered, provide 'sensor' option to specify sensor."
+                )
+            else:
+                raise req.error(
+                    "Requested sensor '%s' not found, specify a valid or no sensor to use default"
+                    % (sensor,)
+                )
+        handler(req)
+
+
+class BeaconId:
+    def __init__(self, name, tracker):
+        self.name = name
+        self.tracker = tracker
+
+    def is_unnamed(self):
+        return self.name is None
+
+    def register_command(self, cmd, func, desc):
+        self.tracker.register_gcode_command(self.name, cmd, func, desc)
+
+    def register_endpoint(self, path, callback):
+        self.tracker.register_endpoint(self.name, path, callback)
+
+
+def get_beacons(config):
+    printer = config.get_printer()
+    beacons = printer.lookup_object("beacons", None)
+    if beacons is None:
+        beacons = BeaconTracker(config, printer)
+        printer.add_object("beacons", beacons)
+    return beacons
 
 
 def load_config(config):
@@ -2435,219 +3929,5 @@ def load_config_prefix(config):
         model = BeaconModel.load(name, config, beacon)
         beacon._register_model(name, model)
         return model
-
-    raise config.error("Unknown Beacon config section '%s'" % (secname,))
-
-
-def get_beacons(config):
-    printer = config.get_printer()
-    beacons = printer.lookup_object("beacons", None)
-    if beacons is None:
-        beacons = BeaconTracker(config, printer)
-        printer.add_object("beacons", beacons)
-    return beacons
-
-
-class BeaconTracker:
-    def __init__(self, config, printer):
-        self.printer = printer
-        self.sensors = {}
-        self.gcode_commands = {}
-        self.endpoints = {}
-        self.webhooks = printer.lookup_object("webhooks")
-
-        self.gcode = printer.lookup_object("gcode")
-        self.gcode.register_command(
-            "BEACON_VARS", self.cmd_BEACON_VARS, desc=self.cmd_BEACON_VARS_help
-        )
-
-    def get_or_add_sensor(self, name):
-        if name in self.sensors:
-            return self.sensors[name]
-        sensor_id = BeaconSensorId(name, self)
-        self.sensors[name] = beacon = BeaconProbe(
-            self.printer.lookup_object("configfile").get_config_wrapper(
-                self.printer, "beacon"
-            ),
-            sensor_id,
-        )
-        return beacon
-
-    def register_gcode_command(self, sensor_name, cmd, func, desc):
-        if cmd not in self.gcode_commands:
-            self.gcode_commands[cmd] = {}
-            self.gcode.register_command(cmd, self._dispatch_gcode_command, desc=desc)
-        self.gcode_commands[cmd][sensor_name] = func
-
-    def _dispatch_gcode_command(self, gcmd):
-        cmd = gcmd.get_command()
-        handlers = self.gcode_commands[cmd]
-        if len(handlers) == 1 and None in handlers:
-            return handlers[None](gcmd)
-        name = gcmd.get("SENSOR", None)
-        if name is None:
-            if None in handlers:
-                return handlers[None](gcmd)
-            # If there is only one sensor, default to it
-            if len(self.sensors) == 1:
-                return handlers[list(self.sensors.keys())[0]](gcmd)
-            raise gcmd.error("Must specify SENSOR for command '%s'" % (cmd,))
-        if name not in handlers:
-            raise gcmd.error(
-                "Sensor '%s' does not support command '%s'" % (name, cmd)
-            )
-        return handlers[name](gcmd)
-
-    def register_endpoint(self, sensor_name, path, callback):
-        if path not in self.endpoints:
-            self.endpoints[path] = {}
-            self.webhooks.register_endpoint(path, self._dispatch_endpoint)
-        self.endpoints[path][sensor_name] = callback
-
-    def _dispatch_endpoint(self, web_request):
-        path = web_request.get_path()
-        handlers = self.endpoints[path]
-        if len(handlers) == 1 and None in handlers:
-            return handlers[None](web_request)
-        # TODO: how to support multiple sensors here?
-        # Maybe argument in path or query string?
-        # For now just grab the first one
-        return handlers[list(handlers.keys())[0]](web_request)
-
-    cmd_BEACON_VARS_help = "Get beacon internal variables"
-
-    def cmd_BEACON_VARS(self, gcmd):
-        name = gcmd.get("SENSOR", None)
-        if name is None and len(self.sensors) == 1:
-            name = list(self.sensors.keys())[0]
-        if name not in self.sensors:
-            raise gcmd.error("Must specify SENSOR")
-        beacon = self.sensors[name]
-        gcmd.respond_info("Beacon variables:")
-        gcmd.respond_info("  approach_speed: %.2f" % (beacon.approach_speed,))
-        gcmd.respond_info("  autocal_accel: %.2f" % (beacon.autocal_accel,))
-        gcmd.respond_info("  autocal_speed: %.2f" % (beacon.autocal_speed,))
-        gcmd.respond_info(
-            "  autocal_retract_dist: %.2f" % (beacon.autocal_retract_dist,)
-        )
-        gcmd.respond_info(
-            "  autocal_retract_speed: %.2f" % (beacon.autocal_retract_speed,)
-        )
-        gcmd.respond_info("  autocal_sample_count: %d" % (beacon.autocal_sample_count,))
-        gcmd.respond_info("  autocal_tolerance: %.4f" % (beacon.autocal_tolerance,))
-        gcmd.respond_info("  autocal_max_retries: %d" % (beacon.autocal_max_retries,))
-        gcmd.respond_info("  z_settling_time: %d" % (beacon.z_settling_time,))
-        gcmd.respond_info("  contact_latency_min: %d" % (beacon.contact_latency_min,))
-        gcmd.respond_info("  contact_sensitivity: %d" % (beacon.contact_sensitivity,))
-        gcmd.respond_info("  speed: %.2f" % (beacon.speed,))
-        gcmd.respond_info("  lift_speed: %.2f" % (beacon.lift_speed,))
-        gcmd.respond_info("  backlash_comp: %.2f" % (beacon.backlash_comp,))
-        gcmd.respond_info("  x_offset: %.2f" % (beacon.x_offset,))
-        gcmd.respond_info("  y_offset: %.2f" % (beacon.y_offset,))
-        gcmd.respond_info("  trigger_distance: %.2f" % (beacon.trigger_distance,))
-        gcmd.respond_info(
-            "  trigger_dive_threshold: %.2f" % (beacon.trigger_dive_threshold,)
-        )
-        gcmd.respond_info("  trigger_hysteresis: %.4f" % (beacon.trigger_hysteresis,))
-        gcmd.respond_info("  cal_nozzle_z: %.2f" % (beacon.cal_nozzle_z,))
-        gcmd.respond_info("  cal_floor: %.2f" % (beacon.cal_floor,))
-        gcmd.respond_info("  cal_ceil: %.2f" % (beacon.cal_ceil,))
-        gcmd.respond_info("  cal_speed: %.2f" % (beacon.cal_speed,))
-        gcmd.respond_info("  cal_move_speed: %.2f" % (beacon.cal_move_speed,))
-        gcmd.respond_info("  default_probe_method: %s" % (beacon.default_probe_method,))
-        gcmd.respond_info("  contact_max_hotend_temperature: %.1f" % (beacon.mcu_contact_probe.max_hotend_temp,))
-
-    def home_dir(self):
-        return os.path.dirname(os.path.realpath(__file__))
-
-
-class APIDumpHelper:
-    def __init__(self, printer, start_callback, stop_callback, log_callback):
-        self.printer = printer
-        self.start_callback = start_callback
-        self.stop_callback = stop_callback
-        self.log_callback = log_callback
-        self.clients = []
-        self.buffer = []
-        self.stream = None
-        self.lock = threading.Lock()
-
-    def add_web_client(self, web_request):
-        with self.lock:
-            self.clients.append(web_request)
-            if self.stream is None:
-                self.stream = self.start_callback()
-                self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
-
-        def disconnect():
-            with self.lock:
-                if web_request in self.clients:
-                    self.clients.remove(web_request)
-                    if not self.clients:
-                        self.stop_callback(self.stream)
-                        self.stream = None
-                        self.buffer = []
-
-        web_request.on_disconnect(disconnect)
-        self.printer.get_reactor().register_async_callback(lambda e: self._send(web_request))
-
-    def _handle_disconnect(self):
-        with self.lock:
-            self.clients = []
-            if self.stream is not None:
-                self.stop_callback(self.stream)
-                self.stream = None
-                self.buffer = []
-
-    def _send(self, web_request):
-        if web_request not in self.clients:
-            return
-        if not self.buffer:
-            self.printer.get_reactor().register_timer(
-                lambda e: self._send(web_request), self.printer.get_reactor().monotonic() + 0.1
-            )
-            return
-        with self.lock:
-            data = list(self.buffer)
-            self.buffer = []
-        web_request.send({"data": data})
-        self.printer.get_reactor().register_async_callback(lambda e: self._send(web_request))
-
-
-class BeaconAccelConfig:
-    def __init__(self, config):
-        self.cs_pin = config.get("accel_cs_pin", "beacon:CS")
-        self.spi_speed = config.getint("accel_spi_speed", 5000000)
-        self.axes_map = config.getlist("accel_axes_map", ("x", "y", "z"))
-
-
-class BeaconAccelHelper:
-    def __init__(self, beacon, config, constants):
-        self.beacon = beacon
-        self.printer = beacon.printer
-        self.name = beacon.name
-        self.config = config
-        self.adxl = adxl345.ADXL345(config)
-        self.adxl_client = None
-
-    def reinit(self, constants):
-        self.adxl = adxl345.ADXL345(self.config)
-
-    def start_internal_client(self):
-        self.adxl_client = self.adxl.start_internal_client()
-        return self.adxl_client
-
-
-class BeaconSensorId:
-    def __init__(self, name, tracker):
-        self.name = name
-        self.tracker = tracker
-
-    def is_unnamed(self):
-        return self.name is None
-
-    def register_command(self, cmd, func, desc):
-        self.tracker.register_gcode_command(self.name, cmd, func, desc)
-
-    def register_endpoint(self, path, callback):
-        self.tracker.register_endpoint(self.name, path, callback)
+    else:
+        raise config.error("Unknown beacon config directive '%s'" % (secname,))
