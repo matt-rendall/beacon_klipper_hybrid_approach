@@ -184,9 +184,18 @@ class BeaconProbe:
         printer.register_event_handler("klippy:connect", self._handle_connect)
         printer.register_event_handler("klippy:shutdown", self.force_stop_streaming)
         self._mcu.register_config_callback(self._build_config)
-        self._mcu.register_response(self._handle_beacon_data, "beacon_data")
-        self._mcu.register_response(self._handle_beacon_status, "beacon_status")
-        self._mcu.register_response(self._handle_beacon_contact, "beacon_contact")
+        self.compat_mcu_register_response(
+            self._handle_beacon_data,
+            "beacon_data samples=%c start_clock=%u delta_clock=%u data=%*s",
+        )
+        self.compat_mcu_register_response(
+            self._handle_beacon_status,
+            "beacon_status mcu_temp=%u supply_voltage=%u coil_temp=%u status=%u",
+        )
+        self.compat_mcu_register_response(
+            self._handle_beacon_contact,
+            "beacon_contact armed_clock=%u trigger_clock=%u detect_clock=%u latency=%c error=%c",
+        )
 
         # Register webhooks
         self._api_dump = APIDumpHelper(
@@ -255,8 +264,8 @@ class BeaconProbe:
         )
         if self.mod_axis_twist_comp:
             if hasattr(self.mod_axis_twist_comp, "get_z_compensation_value"):
-                self.get_z_compensation_value = (
-                    lambda pos: self.mod_axis_twist_comp.get_z_compensation_value(pos)
+                self.get_z_compensation_value = lambda pos: (
+                    self.mod_axis_twist_comp.get_z_compensation_value(pos)
                 )
             elif hasattr(manual_probe, "ProbeResult"):
 
@@ -1148,12 +1157,17 @@ class BeaconProbe:
     def compat_create_probe_result(self, test_pos):
         if BeaconProbe.probe_result_builder is None:
             if hasattr(manual_probe, "ProbeResult"):
-
                 BeaconProbe.probe_result_builder = prb_proberesult
             else:
-
                 BeaconProbe.probe_result_builder = prb_identity
         return BeaconProbe.probe_result_builder(self, test_pos)
+
+    def compat_mcu_register_response(self, cb, msg, oid=None):
+        if hasattr(self._mcu, "register_serial_response"):
+            return self._mcu.register_serial_response(cb, msg, oid)
+        else:
+            name = msg.split()[0]
+            return self._mcu.register_response(cb, name, oid)
 
     # GCode command handlers
 
@@ -1662,6 +1676,7 @@ class BeaconProbe:
             "delta": delta,
         }
 
+
 def prb_proberesult(beacon, test_pos):
     (x, y, z) = beacon.get_offsets()
     return manual_probe.ProbeResult(
@@ -1673,8 +1688,10 @@ def prb_proberesult(beacon, test_pos):
         test_pos[2],
     )
 
+
 def prb_identity(beacon, test_pos):
     return test_pos
+
 
 class BeaconModel:
     @classmethod
@@ -3475,8 +3492,13 @@ class BeaconAccelHelper(object):
         self._last_raw_sample = (0, 0, 0)
         self._sample_lock = threading.Lock()
 
-        beacon._mcu.register_response(self._handle_accel_data, "beacon_accel_data")
-        beacon._mcu.register_response(self._handle_accel_state, "beacon_accel_state")
+        beacon.compat_mcu_register_response(
+            self._handle_accel_data,
+            "beacon_accel_data start_clock=%u delta_clock=%u data=%*s",
+        )
+        beacon.compat_mcu_register_response(
+            self._handle_accel_state, "beacon_accel_state en=%c err=%c"
+        )
 
         self.reinit(constants)
 
