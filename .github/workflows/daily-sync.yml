@@ -1,0 +1,18 @@
+name: Daily Fork Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  workflow_dispatch: # Adds a button to let you trigger it manually
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required so the action can push the synced code to your fork
+
+    steps:
+      - name: Sync branch with upstream
+        run: gh repo sync ${{ github.repository }} -b main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
