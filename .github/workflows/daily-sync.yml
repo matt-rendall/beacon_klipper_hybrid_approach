@@ -13,6 +13,6 @@ jobs:
 
     steps:
       - name: Sync branch with upstream
-        run: gh repo sync ${{ github.repository }} -b main
+        run: gh repo sync ${{ github.repository }} -b master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
