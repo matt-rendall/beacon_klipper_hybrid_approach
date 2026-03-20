@@ -179,6 +179,7 @@ class BeaconProbe:
         )
         if register_as_probe:
             printer.lookup_object("pins").register_chip("probe", self)
+            self.printer.add_object("probe", BeaconProbeWrapper(self))
 
         # Register event handlers
         printer.register_event_handler("klippy:connect", self._handle_connect)
@@ -3840,8 +3841,6 @@ class BeaconTracker:
                 )
             cfg = self.config.getsection("beacon sensor " + name)
         self.sensors[name] = sensor = BeaconProbe(cfg, BeaconId(name, self))
-        if name is None:
-            self.printer.add_object("probe", BeaconProbeWrapper(sensor))
         coil_name = "beacon_coil" if name is None else "beacon_%s_coil" % (name,)
         temp = BeaconTempWrapper(sensor)
         self.printer.add_object("temperature_sensor " + coil_name, temp)
